@@ -1,0 +1,126 @@
+name: NovelForge external consumer runner probe
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  external-consumer-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXPECTED_CALLER_REPO: xiaooye/gatech-crawler
+      EXPECTED_FRAMEWORK_REPO: xiaooye/cn_webnovel_agent
+      EXPECTED_FRAMEWORK_COMMIT: 5554b464c6bc00ead8ac3eb2a818ad0e07d70caa
+      PYTHONNOUSERSITE: '1'
+      PYTHONPYCACHEPREFIX: /tmp/novelforge-external-probe-pycache
+    steps:
+      - name: Checkout public carrier repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify external caller identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = "$EXPECTED_CALLER_REPO"
+          python - <<'PY'
+          import json, os
+          print(json.dumps({
+              "caller_repo": os.environ["GITHUB_REPOSITORY"],
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "github_event_name": os.environ.get("GITHUB_EVENT_NAME"),
+              "authority": False,
+              "model_execution": False,
+          }, indent=2))
+          PY
+
+      - name: Checkout exact pinned NovelForge release
+        uses: actions/checkout@v4
+        with:
+          repository: xiaooye/cn_webnovel_agent
+          ref: 5554b464c6bc00ead8ac3eb2a818ad0e07d70caa
+          path: .novelforge-probe
+          persist-credentials: false
+
+      - name: Verify exact Framework materialization
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git -C .novelforge-probe rev-parse HEAD)"
+          test "$actual" = "$EXPECTED_FRAMEWORK_COMMIT"
+          test -z "$(git -C .novelforge-probe status --porcelain=v1 --untracked-files=all)"
+
+      - name: Run pinned deterministic quality contracts
+        working-directory: .novelforge-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python quality/quality_taxonomy.py self-test > ../taxonomy.json
+          python quality/repair_policy.py self-test > ../repair-policy.json
+          python quality/production_readiness.py self-test > ../production-readiness.json
+          python harness/semantic_workers/registered_contract_binding.py self-test > ../registered-contract-binding.json
+          python harness/semantic_workers/peer_bridge_receipt.py self-test > ../peer-bridge-receipt.json
+          python harness/control_plane/control_plane.py --db /tmp/novelforge-external-probe.db self-test > ../control-plane.json
+
+      - name: Assert contract results and write probe report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os
+          checks = {
+              "taxonomy.json": ("quality_taxonomy_contract", "PASS"),
+              "repair-policy.json": ("repair_policy_contract", "PASS"),
+              "production-readiness.json": ("production_readiness_contract", "PASS"),
+              "registered-contract-binding.json": ("registered_contract_binding_contract", "PASS"),
+              "peer-bridge-receipt.json": ("peer_bridge_receipt_contract", "PASS"),
+              "control-plane.json": ("control_plane_contract", "PASS"),
+          }
+          observed = {}
+          for path, (key, expected) in checks.items():
+              data = json.load(open(path, encoding="utf-8"))
+              actual = data.get(key)
+              assert actual == expected, (path, key, actual, data)
+              observed[key] = actual
+          report = {
+              "schema": "novelforge_external_public_runner_probe_v1",
+              "result": "PASS",
+              "caller_repo": os.environ["GITHUB_REPOSITORY"],
+              "caller_sha": os.environ.get("GITHUB_SHA"),
+              "framework_repo": os.environ["EXPECTED_FRAMEWORK_REPO"],
+              "framework_commit": os.environ["EXPECTED_FRAMEWORK_COMMIT"],
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "checks": observed,
+              "private_project_content": False,
+              "production_project_receipt": False,
+              "literary_judgment": False,
+              "authority": False,
+              "model_execution": False,
+          }
+          json.dump(report, open("novelforge-external-runner-probe.json", "w", encoding="utf-8"), indent=2)
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Upload probe evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: novelforge-external-public-runner-probe
+          path: |
+            novelforge-external-runner-probe.json
+            taxonomy.json
+            repair-policy.json
+            production-readiness.json
+            registered-contract-binding.json
+            peer-bridge-receipt.json
+            control-plane.json
+          if-no-files-found: error
+          retention-days: 7
